@@ -30,6 +30,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 using socket.core.Common;
 
 namespace socket.core.Server
@@ -37,7 +38,7 @@ namespace socket.core.Server
     /// <summary>
     /// UPD 服务类
     /// </summary>
-    public class UdpServer
+    public class UdpServer:IDisposable
     {
         /// <summary>
         /// 用于监听传入连接请求的套接字
@@ -73,6 +74,15 @@ namespace socket.core.Server
         public event Action<EndPoint, int> OnSend;
 
         /// <summary>
+        /// 重复地址
+        /// </summary>
+        private bool reuseAddress;
+
+        private CancellationTokenSource _cancellationToken;
+
+        private Random _random = new Random();
+
+        /// <summary>
         /// 构造方法
         /// </summary>
         /// <param name="receiveBufferSize">接收缓存大小</param>
@@ -102,6 +112,7 @@ namespace socket.core.Server
         /// <param name="reuseAddress">重复地址</param>
         public void Start(int port, bool reuseAddress = false)
         {
+            this.reuseAddress = reuseAddress;
             IPEndPoint localEndPoint = new IPEndPoint(IPAddress.Any, port);
             //创建listens是传入的套接字。
             listenSocket = new Socket(localEndPoint.AddressFamily, SocketType.Dgram, ProtocolType.Udp);
@@ -116,13 +127,23 @@ namespace socket.core.Server
             receiveSocketArgs.Completed += new EventHandler<SocketAsyncEventArgs>(IO_Completed);
             receiveSocketArgs.SetBuffer(receivebuffer, 0, receivebuffer.Length);
             StartReceive(receiveSocketArgs);
+            _cancellationToken = new CancellationTokenSource();
+
             //发送线程
             for (int i = 0; i < sendthread; i++)
             {
-                Thread thread = new Thread(StartSend);
-                thread.IsBackground = true;
-                thread.Priority = ThreadPriority.AboveNormal;
-                thread.Start(i);
+                var i1 = i;
+                Task.Factory.StartNew(() => StartSend(i1), _cancellationToken.Token)
+                    .ContinueWith(task =>
+                    {
+                        _cancellationToken?.Dispose();
+                        _cancellationToken = null;
+                    });
+
+                //Thread thread = new Thread(StartSend);
+                //thread.IsBackground = true;
+                //thread.Priority = ThreadPriority.AboveNormal;
+                //thread.Start(i);
             }
         }
 
@@ -132,7 +153,7 @@ namespace socket.core.Server
         /// <param name="receiveSocketArgs">操作对象</param>
         private void StartReceive(SocketAsyncEventArgs receiveSocketArgs)
         {
-            if (!listenSocket.ReceiveFromAsync(receiveSocketArgs))
+            if (listenSocket?.ReceiveFromAsync(receiveSocketArgs)==false)
             {
                 ProcessReceive(receiveSocketArgs);
             }
@@ -143,14 +164,14 @@ namespace socket.core.Server
         /// </summary>
         /// <param name="e">操作对象</param>
         private void ProcessReceive(SocketAsyncEventArgs e)
-        {
+        {            
             if (e.BytesTransferred > 0 && e.SocketError == SocketError.Success)
             {
-                if (OnReceive != null)
-                {
-                    OnReceive(e.RemoteEndPoint, e.Buffer, e.Offset, e.BytesTransferred);
-                }
+                OnReceive?.Invoke(e.RemoteEndPoint, e.Buffer, e.Offset, e.BytesTransferred);
             }
+
+            if (listenSocket == null) return;
+            if (e.SocketError != SocketError.Success) return;
             StartReceive(e);
         }
 
@@ -158,12 +179,13 @@ namespace socket.core.Server
         /// 开始启用发送
         /// </summary>
         /// <param name="thread">线程序号</param>
-        private void StartSend(object thread)
+        private void StartSend(int thread)
         {
             while (true)
             {
-                SendingQueue sending;
-                if (sendQueues[(int)thread].TryDequeue(out sending))
+                _cancellationToken?.Token.ThrowIfCancellationRequested();
+
+                if (sendQueues[thread].TryDequeue(out var sending))
                 {
                     Send(sending);
                 }
@@ -183,7 +205,13 @@ namespace socket.core.Server
         /// <param name="length">长度</param>
         public void Send(EndPoint remoteEndPoint, byte[] data, int offset, int length)
         {
-            sendQueues[((IPEndPoint)remoteEndPoint).Port % sendthread].Enqueue(new SendingQueue() { remoteEndPoint = remoteEndPoint, data = data, offset = offset, length = length });
+            sendQueues[_random.Next(0, sendthread)].Enqueue(new SendingQueue()
+            {
+                remoteEndPoint = remoteEndPoint,
+                data = data,
+                offset = offset,
+                length = length
+            });
         }
 
         /// <summary>
@@ -192,21 +220,30 @@ namespace socket.core.Server
         /// <param name="sendQuere">发送消息体</param>
         private void Send(SendingQueue sendQuere)
         {
-            mutex.WaitOne();
-            if (m_sendPool.Count == 0)
+            try
             {
-                SocketAsyncEventArgs saea_send = new SocketAsyncEventArgs();
-                saea_send.Completed += new EventHandler<SocketAsyncEventArgs>(IO_Completed);
-                m_sendPool.Push(saea_send);
+                mutex.WaitOne();
+                if (m_sendPool.Count == 0)
+                {
+                    SocketAsyncEventArgs saea_send = new SocketAsyncEventArgs();
+                    saea_send.Completed += new EventHandler<SocketAsyncEventArgs>(IO_Completed);
+                    m_sendPool.Push(saea_send);
+                }
+                SocketAsyncEventArgs socketArgs = m_sendPool.Pop();
+                mutex.ReleaseMutex();
+
+                socketArgs.RemoteEndPoint = sendQuere.remoteEndPoint;
+                socketArgs.SetBuffer(sendQuere.data, sendQuere.offset, sendQuere.length);
+
+                if (listenSocket?.SendToAsync(socketArgs) == false)
+                {
+                    ProcessSend(socketArgs);
+                }
             }
-            SocketAsyncEventArgs socketArgs = m_sendPool.Pop();
-            mutex.ReleaseMutex();
-            socketArgs.RemoteEndPoint = sendQuere.remoteEndPoint;
-            socketArgs.SetBuffer(sendQuere.data, sendQuere.offset, sendQuere.length);
-            if (!listenSocket.SendToAsync(socketArgs))
+            catch (Exception)
             {
-                ProcessSend(socketArgs);
-            }
+                // ignored
+            }            
         }
 
         /// <summary>
@@ -215,14 +252,10 @@ namespace socket.core.Server
         /// <param name="e">操作对象</param>
         private void ProcessSend(SocketAsyncEventArgs e)
         {
-            if (e.SocketError == SocketError.Success)
-            {
-                m_sendPool.Push(e);
-                if (OnSend != null)
-                {
-                    OnSend(e.RemoteEndPoint, e.BytesTransferred);
-                }
-            }
+            if (e.SocketError != SocketError.Success) return;
+
+            m_sendPool.Push(e);
+            OnSend?.Invoke(e.RemoteEndPoint, e.BytesTransferred);
         }
 
         /// <summary>
@@ -245,6 +278,14 @@ namespace socket.core.Server
             }
         }
 
-
+        /// <inheritdoc 释放资源/>
+        public void Dispose()
+        {
+            _cancellationToken?.Cancel();
+            listenSocket?.Shutdown(SocketShutdown.Both);
+            listenSocket?.Close(2000);
+            listenSocket = null;            
+            //listenSocket?.Dispose();
+        }
     }
 }
