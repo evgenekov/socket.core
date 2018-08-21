@@ -153,7 +153,11 @@ namespace socket.core.Server
         /// <param name="receiveSocketArgs">操作对象</param>
         private void StartReceive(SocketAsyncEventArgs receiveSocketArgs)
         {
-            if (listenSocket?.ReceiveFromAsync(receiveSocketArgs)==false)
+            if (listenSocket==null)
+            {
+                return;
+            }
+            if (listenSocket.ReceiveFromAsync(receiveSocketArgs)==false)
             {
                 ProcessReceive(receiveSocketArgs);
             }
@@ -171,8 +175,8 @@ namespace socket.core.Server
             }
 
             if (listenSocket == null) return;
-            //if (e.SocketError != SocketError.Success) 
-            //    return;
+            if (e.SocketError != SocketError.Success) 
+                return;
             StartReceive(e);
         }
 
@@ -285,8 +289,8 @@ namespace socket.core.Server
             _cancellationToken?.Cancel();
             listenSocket?.Shutdown(SocketShutdown.Both);
             listenSocket?.Close(2000);
+            listenSocket?.Dispose();
             listenSocket = null;            
-            //listenSocket?.Dispose();
         }
     }
 }
