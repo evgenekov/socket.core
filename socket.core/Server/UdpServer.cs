@@ -175,7 +175,7 @@ namespace socket.core.Server
             }
 
             if (listenSocket == null) return;
-            if (e.SocketError != SocketError.Success) 
+            if (e.SocketError != SocketError.Success && e.SocketError != SocketError.ConnectionReset)
                 return;
             StartReceive(e);
         }
